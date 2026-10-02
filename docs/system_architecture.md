@@ -1,4 +1,7 @@
 # DMC System Architecture
+## Architecture Diagram
+
+![DMC System Architecture](dmc_system_architecture.png)
 
 ## 1. System Overview
 
