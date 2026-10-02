@@ -1,152 +1,377 @@
 """
 DMC Conflict Detection Module
+SIH26123 - Dynamic Movement Contract Protocol
 
-Detects potential conflicts between AMRs using:
-1. Distance to a shared conflict zone
-2. Estimated time of arrival (ETA)
-3. A configurable temporal conflict window
+Purpose:
+    Detect potential conflicts between AMRs before they enter
+    a shared warehouse conflict zone.
 
-This module is a prototype component for SIH26123.
+Detection uses:
+    1. Same conflict zone
+    2. ETA information
+    3. Temporal occupancy overlap
+
+This is a prototype implementation based on the DMC
+architecture proposed in the SIH submission.
+
+Important:
+    Thresholds used here are prototype parameters and must
+    be validated through simulation.
 """
 
 from dataclasses import dataclass
-from math import hypot
+from typing import Optional
+
+from models import RobotState, MovementIntent
 
 
 @dataclass
-class RobotState:
-    robot_id: str
+class ConflictZone:
+    """
+    Represents a shared warehouse conflict zone.
+
+    x, y:
+        Approximate centre of the conflict zone.
+
+    radius:
+        Prototype spatial influence radius.
+    """
+
+    zone_id: str
     x: float
     y: float
-    speed: float
-    conflict_zone: str
-    destination: str
+    radius: float = 1.0
 
 
 @dataclass
 class ConflictResult:
+    """
+    Result returned by the conflict detector.
+    """
+
     conflict: bool
+    reason: str
+
     robot_a: str
     robot_b: str
-    zone: str
+
+    zone_id: Optional[str]
+
     eta_a: float
     eta_b: float
-    time_difference: float
+
+    entry_overlap: bool
+    exit_overlap: bool
+    temporal_overlap: bool
 
 
 class ConflictDetector:
     """
-    Detects whether two AMRs are likely to require
-    the same conflict zone at approximately the same time.
+    Detects spatial and temporal conflicts between two AMRs.
     """
 
-    def __init__(self, time_window: float = 2.0):
-        self.time_window = time_window
+    def __init__(self, safety_time_window: float = 2.0):
+        """
+        safety_time_window:
+            Additional temporal margin used by the prototype.
+
+        This is NOT an official SIH value.
+        It must be validated experimentally.
+        """
+
+        if safety_time_window < 0:
+            raise ValueError(
+                "safety_time_window cannot be negative"
+            )
+
+        self.safety_time_window = safety_time_window
+
+    # -----------------------------------------------------
+    # Spatial checks
+    # -----------------------------------------------------
 
     @staticmethod
-    def distance_to_zone(robot_x, robot_y, zone_x, zone_y):
-        """Calculate Euclidean distance to a conflict zone."""
-        return hypot(zone_x - robot_x, zone_y - robot_y)
+    def distance(
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+    ) -> float:
+        """Calculate 2D Euclidean distance."""
+
+        dx = x2 - x1
+        dy = y2 - y1
+
+        return (dx * dx + dy * dy) ** 0.5
+
+    def robot_near_zone(
+        self,
+        robot: RobotState,
+        zone: ConflictZone,
+    ) -> bool:
+        """
+        Check whether an AMR is within the conflict-zone
+        influence radius.
+        """
+
+        distance = self.distance(
+            robot.x,
+            robot.y,
+            zone.x,
+            zone.y,
+        )
+
+        return distance <= zone.radius
+
+    # -----------------------------------------------------
+    # Temporal checks
+    # -----------------------------------------------------
 
     @staticmethod
-    def calculate_eta(distance, speed):
+    def intervals_overlap(
+        start_a: float,
+        end_a: float,
+        start_b: float,
+        end_b: float,
+        margin: float = 0.0,
+    ) -> bool:
         """
-        Calculate estimated time of arrival.
+        Check whether two time intervals overlap.
 
-        ETA = distance / speed
+        Example:
 
-        If speed is zero or negative, ETA cannot be calculated.
+            Robot A: |---------|
+            Robot B:       |---------|
+
+        If their occupancy intervals overlap, both robots
+        may require the shared zone simultaneously.
         """
-        if speed <= 0:
-            return float("inf")
 
-        return distance / speed
+        a_start = start_a - margin
+        a_end = end_a + margin
 
-    def check_conflict(
+        b_start = start_b - margin
+        b_end = end_b + margin
+
+        return (
+            a_start < b_end
+            and b_start < a_end
+        )
+
+    # -----------------------------------------------------
+    # Main conflict detection
+    # -----------------------------------------------------
+
+    def detect(
         self,
         robot_a: RobotState,
+        intent_a: MovementIntent,
         robot_b: RobotState,
-        zone_x: float,
-        zone_y: float,
+        intent_b: MovementIntent,
+        zone: ConflictZone,
     ) -> ConflictResult:
-        """Check whether two robots may conflict at the same zone."""
+        """
+        Detect whether two AMRs have a potential conflict
+        at the same shared zone.
+        """
 
-        eta_a = self.calculate_eta(
-            self.distance_to_zone(
-                robot_a.x,
-                robot_a.y,
-                zone_x,
-                zone_y,
-            ),
-            robot_a.speed,
-        )
-
-        eta_b = self.calculate_eta(
-            self.distance_to_zone(
-                robot_b.x,
-                robot_b.y,
-                zone_x,
-                zone_y,
-            ),
-            robot_b.speed,
-        )
-
-        time_difference = abs(eta_a - eta_b)
+        # ---------------------------------------------
+        # 1. Check zone identity
+        # ---------------------------------------------
 
         same_zone = (
-            robot_a.conflict_zone == robot_b.conflict_zone
+            intent_a.conflict_zone == zone.zone_id
+            and intent_b.conflict_zone == zone.zone_id
         )
 
-        conflict = (
-            same_zone
-            and time_difference < self.time_window
+        if not same_zone:
+            return ConflictResult(
+                conflict=False,
+                reason="Different conflict zones",
+                robot_a=robot_a.robot_id,
+                robot_b=robot_b.robot_id,
+                zone_id=zone.zone_id,
+                eta_a=intent_a.eta,
+                eta_b=intent_b.eta,
+                entry_overlap=False,
+                exit_overlap=False,
+                temporal_overlap=False,
+            )
+
+        # ---------------------------------------------
+        # 2. Check spatial proximity
+        # ---------------------------------------------
+
+        spatial_a = self.robot_near_zone(
+            robot_a,
+            zone,
         )
+
+        spatial_b = self.robot_near_zone(
+            robot_b,
+            zone,
+        )
+
+        spatially_relevant = spatial_a or spatial_b
+
+        if not spatially_relevant:
+            return ConflictResult(
+                conflict=False,
+                reason="Robots are outside zone influence",
+                robot_a=robot_a.robot_id,
+                robot_b=robot_b.robot_id,
+                zone_id=zone.zone_id,
+                eta_a=intent_a.eta,
+                eta_b=intent_b.eta,
+                entry_overlap=False,
+                exit_overlap=False,
+                temporal_overlap=False,
+            )
+
+        # ---------------------------------------------
+        # 3. Check entry-time overlap
+        # ---------------------------------------------
+
+        entry_difference = abs(
+            intent_a.expected_entry_time
+            - intent_b.expected_entry_time
+        )
+
+        entry_overlap = (
+            entry_difference
+            <= self.safety_time_window
+        )
+
+        # ---------------------------------------------
+        # 4. Check occupancy interval overlap
+        # ---------------------------------------------
+
+        temporal_overlap = self.intervals_overlap(
+            intent_a.expected_entry_time,
+            intent_a.expected_exit_time,
+            intent_b.expected_entry_time,
+            intent_b.expected_exit_time,
+            margin=self.safety_time_window,
+        )
+
+        # ---------------------------------------------
+        # 5. Final decision
+        # ---------------------------------------------
+
+        conflict = (
+            spatially_relevant
+            and temporal_overlap
+        )
+
+        if conflict:
+            reason = (
+                "Same conflict zone with overlapping "
+                "occupancy windows"
+            )
+        elif entry_overlap:
+            reason = (
+                "Entry times are close but occupancy "
+                "windows do not overlap"
+            )
+        else:
+            reason = (
+                "Same zone but no temporal conflict"
+            )
 
         return ConflictResult(
             conflict=conflict,
+            reason=reason,
             robot_a=robot_a.robot_id,
             robot_b=robot_b.robot_id,
-            zone=robot_a.conflict_zone,
-            eta_a=eta_a,
-            eta_b=eta_b,
-            time_difference=time_difference,
+            zone_id=zone.zone_id,
+            eta_a=intent_a.eta,
+            eta_b=intent_b.eta,
+            entry_overlap=entry_overlap,
+            exit_overlap=temporal_overlap,
+            temporal_overlap=temporal_overlap,
         )
 
 
+# =========================================================
+# Simple standalone demonstration
+# =========================================================
+
 if __name__ == "__main__":
 
-    detector = ConflictDetector(time_window=2.0)
+    detector = ConflictDetector(
+        safety_time_window=2.0
+    )
+
+    zone = ConflictZone(
+        zone_id="Z1",
+        x=5.0,
+        y=5.0,
+        radius=3.0,
+    )
 
     robot_1 = RobotState(
         robot_id="AMR_1",
-        x=0.0,
-        y=0.0,
+        x=3.0,
+        y=5.0,
+        heading=0.0,
         speed=1.0,
+        current_task="Pickup_A",
+        destination="Drop_A",
         conflict_zone="Z1",
-        destination="Pickup_A",
     )
 
     robot_2 = RobotState(
         robot_id="AMR_2",
-        x=4.0,
-        y=0.0,
+        x=7.0,
+        y=5.0,
+        heading=3.14,
         speed=1.0,
+        current_task="Pickup_B",
+        destination="Drop_B",
         conflict_zone="Z1",
-        destination="Pickup_B",
     )
 
-    result = detector.check_conflict(
+    intent_1 = MovementIntent(
+        robot_id="AMR_1",
+        conflict_zone="Z1",
+        eta=2.0,
+        expected_entry_time=10.0,
+        expected_exit_time=14.0,
+        planned_path=[
+            (3.0, 5.0),
+            (5.0, 5.0),
+        ],
+        destination="Drop_A",
+    )
+
+    intent_2 = MovementIntent(
+        robot_id="AMR_2",
+        conflict_zone="Z1",
+        eta=3.0,
+        expected_entry_time=11.0,
+        expected_exit_time=15.0,
+        planned_path=[
+            (7.0, 5.0),
+            (5.0, 5.0),
+        ],
+        destination="Drop_B",
+    )
+
+    result = detector.detect(
         robot_1,
+        intent_1,
         robot_2,
-        zone_x=2.0,
-        zone_y=0.0,
+        intent_2,
+        zone,
     )
 
-    print("DMC Conflict Detection")
-    print("----------------------")
-    print(f"Robots: {result.robot_a} vs {result.robot_b}")
-    print(f"Conflict Zone: {result.zone}")
-    print(f"ETA {result.robot_a}: {result.eta_a:.2f}s")
-    print(f"ETA {result.robot_b}: {result.eta_b:.2f}s")
-    print(f"ETA Difference: {result.time_difference:.2f}s")
-    print(f"Conflict Detected: {result.conflict}")
+    print("\nDMC CONFLICT DETECTION")
+    print("======================")
+    print(f"Robots       : {result.robot_a} vs {result.robot_b}")
+    print(f"Zone         : {result.zone_id}")
+    print(f"ETA A        : {result.eta_a:.2f}s")
+    print(f"ETA B        : {result.eta_b:.2f}s")
+    print(f"Entry overlap: {result.entry_overlap}")
+    print(f"Time overlap : {result.temporal_overlap}")
+    print(f"Conflict     : {result.conflict}")
+    print(f"Reason       : {result.reason}")
